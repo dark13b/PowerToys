@@ -165,22 +165,63 @@ internal static class JsExtensionPackageLayout
                     continue;
                 }
 
-                var destination = Path.Combine(assembledNodeModules, name);
-                if (Directory.Exists(entry))
+                // npm groups scoped packages under a single node_modules/@scope directory. That
+                // directory is a scope, not a package, so it must be merged one package at a time.
+                // Moving the whole @scope wholesale drops sibling scoped packages whenever the
+                // destination scope already exists (for example, a version-pinned scoped
+                // dependency the package bundled under the same scope).
+                if (Directory.Exists(entry) && name.StartsWith('@'))
                 {
-                    if (!Directory.Exists(destination))
-                    {
-                        Directory.Move(entry, destination);
-                    }
+                    MergeScopedDependencies(entry, Path.Combine(assembledNodeModules, name));
+                    continue;
                 }
-                else if (!File.Exists(destination))
-                {
-                    File.Move(entry, destination);
-                }
+
+                MergeDependencyEntry(entry, Path.Combine(assembledNodeModules, name));
             }
         }
 
         return assembledDirectory;
+    }
+
+    /// <summary>
+    /// Merges every package under a hoisted <c>node_modules/@scope</c> directory into the
+    /// destination scope directory, one package at a time. A scope directory is not a package,
+    /// so a sibling scoped package that already exists at the destination is preserved rather
+    /// than causing the whole incoming scope to be skipped.
+    /// </summary>
+    private static void MergeScopedDependencies(string sourceScopeDirectory, string destinationScopeDirectory)
+    {
+        Directory.CreateDirectory(destinationScopeDirectory);
+
+        foreach (var scopedPackage in Directory.EnumerateFileSystemEntries(sourceScopeDirectory))
+        {
+            var name = Path.GetFileName(scopedPackage);
+            if (string.IsNullOrEmpty(name))
+            {
+                continue;
+            }
+
+            MergeDependencyEntry(scopedPackage, Path.Combine(destinationScopeDirectory, name));
+        }
+    }
+
+    /// <summary>
+    /// Moves a single hoisted dependency entry to its destination, keeping any entry the package
+    /// already carries at that destination.
+    /// </summary>
+    private static void MergeDependencyEntry(string source, string destination)
+    {
+        if (Directory.Exists(source))
+        {
+            if (!Directory.Exists(destination))
+            {
+                Directory.Move(source, destination);
+            }
+        }
+        else if (!File.Exists(destination))
+        {
+            File.Move(source, destination);
+        }
     }
 
     private static bool HasValidManifest(string directory)

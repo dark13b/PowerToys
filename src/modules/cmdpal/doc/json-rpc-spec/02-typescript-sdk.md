@@ -7,11 +7,22 @@
 
 ## Installation
 
+The SDK is not published to npm yet, so you consume it from this repository rather than from the registry. Build the SDK once so its `dist` output exists:
+
 ```bash
-npm install @microsoft/cmdpal-sdk@0.1.0
+cd src/modules/cmdpal/ts-sdk
+npm ci && npm run build
 ```
 
-The shipped package is ESM (`"type": "module"`) and exposes `./dist/index.js` with type declarations from `./dist/index.d.ts`. Repository samples reference the SDK with `"@microsoft/cmdpal-sdk": "file:../../ts-sdk"`.
+Then reference it from your extension through a relative `file:` dependency that points at your checkout of `src/modules/cmdpal/ts-sdk`. Adjust the relative path to match where your extension lives:
+
+```bash
+npm install "@microsoft/cmdpal-sdk@file:../path/to/src/modules/cmdpal/ts-sdk"
+```
+
+Repository samples use the same mechanism, referencing the SDK with `"@microsoft/cmdpal-sdk": "file:../../ts-sdk"` because they sit two folders below `ts-sdk`. Once the package is published to npm, a versioned `npm install @microsoft/cmdpal-sdk` will replace the `file:` dependency.
+
+The shipped package is ESM (`"type": "module"`) and exposes `./dist/index.js` with type declarations from `./dist/index.d.ts`.
 
 
 ---
@@ -212,11 +223,12 @@ interface IFallbackHandler {
 
 ### ContextItem
 
-An action in a right-click or overflow menu.
+An action in a right-click or overflow menu. A context item can itself carry `moreCommands`, so context menus can nest into sub-menus.
 
 ```typescript
 interface ContextItem {
   command: ICommand;
+  moreCommands?: ContextItem[];   // Nested sub-menu of further context actions
   icon?: IconInfo | null;
   title: string;
   subtitle?: string;

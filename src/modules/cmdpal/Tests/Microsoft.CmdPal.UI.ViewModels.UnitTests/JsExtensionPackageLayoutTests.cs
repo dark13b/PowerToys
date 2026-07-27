@@ -156,6 +156,38 @@ public class JsExtensionPackageLayoutTests
         Assert.AreEqual("Sample", discovered[0].Manifest.DisplayName);
     }
 
+    [TestMethod]
+    public void AssembleDiscoveryLayout_PreservesAllScopedAndUnscopedHoistedDependencies()
+    {
+        var stagingDir = Path.Combine(_root, "staging");
+        var packageDir = CreateCmdPalPackage(stagingDir, "sample-ext", "1.0.0", "Sample");
+
+        // The package bundles its own version-pinned scoped dependency under @a. This makes the
+        // destination @a scope directory already exist when the hoisted @a packages are merged,
+        // which is exactly the layout that previously dropped the hoisted siblings.
+        var bundledScoped = Path.Combine(packageDir, "node_modules", "@a", "bundled");
+        Directory.CreateDirectory(bundledScoped);
+        File.WriteAllText(Path.Combine(bundledScoped, "index.js"), "module.exports = 0;");
+
+        // Mixed hoisted dependencies: two packages share the @a scope, one uses @b, one is plain.
+        CreatePlainDependency(stagingDir, "@a/one");
+        CreatePlainDependency(stagingDir, "@a/two");
+        CreatePlainDependency(stagingDir, "@b/three");
+        CreatePlainDependency(stagingDir, "plain-pkg");
+
+        var resolution = JsExtensionPackageLayout.ResolveRequestedPackage(stagingDir, "sample-ext");
+        Assert.IsTrue(resolution.Succeeded, resolution.ErrorMessage);
+
+        var assembled = JsExtensionPackageLayout.AssembleDiscoveryLayout(stagingDir, resolution.PackageDirectory!);
+
+        var assembledNodeModules = Path.Combine(assembled, "node_modules");
+        Assert.IsTrue(Directory.Exists(Path.Combine(assembledNodeModules, "@a", "one")), "Hoisted @a/one must be preserved.");
+        Assert.IsTrue(Directory.Exists(Path.Combine(assembledNodeModules, "@a", "two")), "Hoisted @a/two must be preserved alongside its sibling under the same scope.");
+        Assert.IsTrue(Directory.Exists(Path.Combine(assembledNodeModules, "@b", "three")), "Hoisted @b/three must be preserved.");
+        Assert.IsTrue(Directory.Exists(Path.Combine(assembledNodeModules, "plain-pkg")), "Hoisted unscoped dependency must be preserved.");
+        Assert.IsTrue(Directory.Exists(Path.Combine(assembledNodeModules, "@a", "bundled")), "The package's own bundled scoped dependency must not be lost when merging the hoisted scope.");
+    }
+
     private static string CreateCmdPalPackage(string stagingDir, string packageName, string version, string displayName)
     {
         var relative = packageName.Replace('/', Path.DirectorySeparatorChar);
