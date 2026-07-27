@@ -206,7 +206,6 @@ Fetches items for a list page.
       "id": "item-1",
       "title": "Item One",
       "subtitle": "Description",
-      "section": "Group A",
       "command": { "id": "item-1-cmd", "name": "Item One" },
       "icon": { "light": { "icon": "\uE8A5" } },
       "tags": [{ "text": "New", "foreground": { "hasValue": true, "color": { "r": 255, "g": 255, "b": 255, "a": 255 } } }],
@@ -229,6 +228,8 @@ Fetches items for a list page.
   ]
 }
 ```
+
+The `section` field is ignored on any item that carries a command. The host renders a command-bearing item as a normal list item, so it never becomes a group header. `section` takes effect only on a command-less row, where it turns that row into a section header. To group command items visually, emit a standalone separator row (see below) before the group.
 
 Items with `_isSeparator: true` are rendered as visual separators:
 ```json

@@ -313,7 +313,7 @@ Expose the settings page like any other page, by returning a `ListItemBase` whos
 
 ## Step 7: Add context commands, tags, and details
 
-List items can carry a details pane, tags, and a flattened context menu. The built-in commands `OpenUrlCommand` and `CopyTextCommand` cover common actions. `OpenUrlCommand` takes the URL first, then an optional name. `CopyTextCommand` takes the text, an optional name, and an optional toast message:
+List items can carry a details pane, tags, and a context menu. The built-in commands `OpenUrlCommand` and `CopyTextCommand` cover common actions. `OpenUrlCommand` takes the URL first, then an optional name. `CopyTextCommand` takes the text, an optional name, and an optional toast message:
 
 ```typescript
 import {
@@ -352,7 +352,7 @@ const item: IListItem = new ListItemBase({
 });
 ```
 
-A note on context menus: the JS protocol flattens context menus to a single level. `ContextItem` has no `moreCommands` of its own, so a deeply nested C# menu becomes one flat list in a JS extension.
+A note on context menus: nested context menus are supported. Each `ContextItem` has its own optional `moreCommands` array, so a context item can carry a sub-menu of further `ContextItem` entries, and the SDK serializes that nesting recursively. This mirrors the C# model, where a context item can itself expose more commands.
 
 ## Step 8: Rebuild and test
 
