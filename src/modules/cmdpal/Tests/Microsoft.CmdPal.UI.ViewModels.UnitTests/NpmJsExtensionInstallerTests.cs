@@ -55,6 +55,50 @@ public class NpmJsExtensionInstallerTests
     }
 
     [TestMethod]
+    public async Task InstallAsync_FailsClosed_WhenPublisherShrinkwrapMissing()
+    {
+        // r3-p5-01: a package whose publisher did not freeze the dependency closure with a published
+        // npm-shrinkwrap.json is rejected, and nothing is promoted into the watched root.
+        var host = CreateHost();
+        var runner = new FakeRunner { PublisherShipsShrinkwrap = false };
+        var installer = new NpmJsExtensionInstaller(host, runner);
+
+        var result = await installer.InstallAsync(ExtensionName, Package, Version, ValidIntegrity, null, CancellationToken.None);
+
+        Assert.IsFalse(result.Succeeded);
+        Assert.AreEqual(
+            Microsoft.CmdPal.UI.ViewModels.Properties.Resources.npm_runner_shrinkwrap_required,
+            result.ErrorMessage);
+        Assert.IsFalse(Directory.Exists(Path.Combine(host.ExtensionsRootPath, ExtensionName)));
+        Assert.IsFalse(host.IsExtensionInstalled(ExtensionName));
+        AssertStagingEmpty(host);
+    }
+
+    [TestMethod]
+    public async Task InstallAsync_PromotesPublisherFrozenClosure_WhenShrinkwrapPresent()
+    {
+        // r3-p5-01: when the publisher shipped a shrinkwrap, the exact frozen tree the runner produced
+        // is what lands in the watched root, shrinkwrap and all, with no re-resolution by the installer.
+        var host = CreateHost();
+        var runner = new FakeRunner { HoistedDependencies = ["left-pad", "ms"] };
+        var installer = new NpmJsExtensionInstaller(host, runner);
+
+        var result = await installer.InstallAsync(ExtensionName, Package, Version, ValidIntegrity, null, CancellationToken.None);
+
+        Assert.IsTrue(result.Succeeded, result.ErrorMessage);
+        var target = Path.Combine(host.ExtensionsRootPath, ExtensionName);
+        Assert.IsTrue(File.Exists(Path.Combine(target, "package.json")));
+
+        // The publisher-frozen shrinkwrap travels with the promoted extension.
+        Assert.IsTrue(File.Exists(Path.Combine(target, "npm-shrinkwrap.json")));
+
+        // The exact closure the publisher froze is installed under the package's own node_modules.
+        Assert.IsTrue(Directory.Exists(Path.Combine(target, "node_modules", "left-pad")));
+        Assert.IsTrue(Directory.Exists(Path.Combine(target, "node_modules", "ms")));
+        AssertStagingEmpty(host);
+    }
+
+    [TestMethod]
     public async Task InstallAsync_PromotesScopedPackage_WithHoistedDependencies()
     {
         var host = CreateHost();
@@ -442,9 +486,9 @@ public class NpmJsExtensionInstallerTests
     [TestMethod]
     public async Task InstallAsync_PreservesMixedScopedAndUnscopedDependencies()
     {
-        // Evidence for r2-p5-07: phase-5 AssembleDiscoveryLayout moves whole top-level node_modules
-        // entries, including @scope directories, so scoped, unscoped, and mixed dependencies all
-        // survive promotion. The scoped-merge discard defect lives only in the phase-6
+        // The publisher-frozen closure npm ci installs under the package's own node_modules, including
+        // @scope directories, survives promotion so scoped, unscoped, and mixed dependencies all land
+        // in the promoted extension. The scoped-merge discard defect lives only in the phase-6
         // JsExtensionPackageLayout, which is absent from phase-5.
         var host = CreateHost();
         var runner = new FakeRunner
@@ -699,6 +743,8 @@ public class NpmJsExtensionInstallerTests
 
         public bool CreatePackage { get; set; } = true;
 
+        public bool PublisherShipsShrinkwrap { get; set; } = true;
+
         public bool ThrowCancelled { get; set; }
 
         public bool ReturnNullIntegrity { get; set; }
@@ -748,6 +794,14 @@ public class NpmJsExtensionInstallerTests
                 return forced;
             }
 
+            // The real runner rejects a package whose publisher did not freeze the dependency closure
+            // with a published npm-shrinkwrap.json. Model that fail-closed decision before any package
+            // is materialized so nothing can be promoted.
+            if (!PublisherShipsShrinkwrap)
+            {
+                return NpmCommandResult.Fail(Microsoft.CmdPal.UI.ViewModels.Properties.Resources.npm_runner_shrinkwrap_required);
+            }
+
             if (CreatePackage)
             {
                 MaterializePackage(stagingDirectory, artifact);
@@ -783,8 +837,10 @@ public class NpmJsExtensionInstallerTests
 
         private void MaterializePackage(string stagingDirectory, NpmArtifact artifact)
         {
-            var relative = artifact.Package.Replace('/', Path.DirectorySeparatorChar);
-            var packageDirectory = Path.Combine(stagingDirectory, "node_modules", relative);
+            // The runner extracts the tarball so the published package is the root project at
+            // <staging>\package, runs npm ci there, and leaves the frozen closure under its own
+            // node_modules. Mirror that layout so the installer promotes it verbatim.
+            var packageDirectory = Path.Combine(stagingDirectory, NpmCommandRunner.PackageRootDirectoryName);
             Directory.CreateDirectory(packageDirectory);
 
             File.WriteAllText(Path.Combine(packageDirectory, "index.js"), "module.exports = {};");
@@ -798,9 +854,14 @@ public class NpmJsExtensionInstallerTests
                 version);
             File.WriteAllText(Path.Combine(packageDirectory, "package.json"), manifest);
 
+            // The publisher-frozen shrinkwrap travels inside the promoted tree.
+            File.WriteAllText(
+                Path.Combine(packageDirectory, "npm-shrinkwrap.json"),
+                "{\"lockfileVersion\":3,\"packages\":{\"\":{\"name\":\"root\"}}}");
+
             foreach (var dependency in HoistedDependencies)
             {
-                var dependencyDirectory = Path.Combine(stagingDirectory, "node_modules", dependency);
+                var dependencyDirectory = Path.Combine(packageDirectory, "node_modules", dependency);
                 Directory.CreateDirectory(dependencyDirectory);
                 File.WriteAllText(Path.Combine(dependencyDirectory, "index.js"), "module.exports = {};");
             }

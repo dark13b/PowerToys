@@ -16,11 +16,13 @@ namespace Microsoft.CmdPal.UI.ViewModels.Services;
 /// <summary>
 /// Installs and uninstalls gallery jsonrpc extensions as a fail-closed transaction over an
 /// immutable, approved artifact. The package, exact version, integrity, and optional registry are
-/// validated up front; npm installs into a unique staging directory outside the watched JSExtensions
-/// root with lifecycle scripts disabled; the resolved integrity, package identity, and manifest are
-/// verified; and only then is the extension atomically promoted into JSExtensions/&lt;name&gt;/ and
-/// awaited for host registration. Staging is always cleaned up, and a failed, timed-out, or cancelled
-/// install never deletes or corrupts an existing install.
+/// validated up front; the runner downloads the exact tarball, requires the publisher-provided
+/// npm-shrinkwrap.json that freezes the whole dependency closure, and installs that frozen closure
+/// with npm ci into a unique staging directory outside the watched JSExtensions root with lifecycle
+/// scripts disabled; the resolved integrity, package identity, and manifest are verified; and only
+/// then is the extension atomically promoted into JSExtensions/&lt;name&gt;/ and awaited for host
+/// registration. Staging is always cleaned up, and a failed, timed-out, or cancelled install never
+/// deletes or corrupts an existing install.
 /// </summary>
 public sealed class NpmJsExtensionInstaller : IJsExtensionInstaller
 {
@@ -166,10 +168,10 @@ public sealed class NpmJsExtensionInstaller : IJsExtensionInstaller
                 return JsExtensionInstallResult.Fail(Resources.npm_installer_integrity_mismatch);
             }
 
-            var packageDirectory = GetInstalledPackageDirectory(stagingDirectory, artifact.Package);
+            var packageDirectory = Path.Combine(stagingDirectory, NpmCommandRunner.PackageRootDirectoryName);
             if (!Directory.Exists(packageDirectory))
             {
-                Logger.LogError($"Installed npm package '{artifact.Package}' but its directory was not found under {stagingDirectory}.");
+                Logger.LogError($"Installed npm package '{artifact.Package}' but its extracted root was not found under {stagingDirectory}.");
                 return JsExtensionInstallResult.Fail(Resources.npm_installer_not_an_extension);
             }
 
@@ -197,14 +199,14 @@ public sealed class NpmJsExtensionInstaller : IJsExtensionInstaller
                 return JsExtensionInstallResult.Fail(Resources.npm_installer_version_mismatch);
             }
 
-            // Assemble the discovery layout inside staging: the package at the root with its (hoisted)
-            // dependencies under its own node_modules.
-            var assembledDirectory = AssembleDiscoveryLayout(stagingDirectory, packageDirectory);
-
+            // The extracted package root already has the discovery layout npm ci produced: package.json
+            // at the root with the publisher-frozen dependency closure under its own node_modules.
+            // Promote it directly.
+            //
             // Atomic promote onto the same volume. The target does not exist (blocked above), so this
             // is a plain rename; the watched root only ever sees the fully validated tree.
             Directory.CreateDirectory(_host.ExtensionsRootPath);
-            Directory.Move(assembledDirectory, targetDirectory);
+            Directory.Move(packageDirectory, targetDirectory);
             promoted = true;
 
             // Only report success once the host has actually loaded and registered the provider.
@@ -266,66 +268,6 @@ public sealed class NpmJsExtensionInstaller : IJsExtensionInstaller
     {
         _host.StopExtension(targetDirectory);
         return _npmCommandRunner.RemoveDirectory(targetDirectory);
-    }
-
-    /// <summary>
-    /// Materializes the discovery layout for a promoted extension inside the staging tree. The
-    /// installed package becomes the extension root, and the sibling dependencies npm hoisted to the
-    /// top-level node_modules are moved under the package's own node_modules so Node.js can resolve
-    /// them after promotion.
-    /// </summary>
-    private static string AssembleDiscoveryLayout(string stagingDirectory, string packageDirectory)
-    {
-        var assembledDirectory = Path.Combine(stagingDirectory, "__cmdpal_assembled");
-        if (Directory.Exists(assembledDirectory))
-        {
-            Directory.Delete(assembledDirectory, recursive: true);
-        }
-
-        // Move the package itself to the assembled root.
-        Directory.Move(packageDirectory, assembledDirectory);
-
-        // Move every remaining hoisted dependency into the package's own node_modules.
-        var topLevelNodeModules = Path.Combine(stagingDirectory, "node_modules");
-        if (Directory.Exists(topLevelNodeModules))
-        {
-            var assembledNodeModules = Path.Combine(assembledDirectory, "node_modules");
-            Directory.CreateDirectory(assembledNodeModules);
-
-            foreach (var entry in Directory.EnumerateFileSystemEntries(topLevelNodeModules))
-            {
-                var name = Path.GetFileName(entry);
-                if (string.IsNullOrEmpty(name))
-                {
-                    continue;
-                }
-
-                var destination = Path.Combine(assembledNodeModules, name);
-                if (Directory.Exists(entry))
-                {
-                    if (!Directory.Exists(destination))
-                    {
-                        Directory.Move(entry, destination);
-                    }
-                }
-                else if (!File.Exists(destination))
-                {
-                    File.Move(entry, destination);
-                }
-            }
-        }
-
-        return assembledDirectory;
-    }
-
-    /// <summary>
-    /// Resolves the directory npm installed the top-level package into, handling both scoped
-    /// (@scope/name) and unscoped package names.
-    /// </summary>
-    private static string GetInstalledPackageDirectory(string stagingDirectory, string package)
-    {
-        var relative = package.Replace('/', Path.DirectorySeparatorChar);
-        return Path.Combine(stagingDirectory, "node_modules", relative);
     }
 
     /// <summary>

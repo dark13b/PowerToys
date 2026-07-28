@@ -1006,7 +1006,7 @@ namespace Microsoft.CmdPal.UI.ViewModels.Properties {
         }
 
         /// <summary>
-        ///   Looks up a localized string similar to npm install failed with exit code {0}.
+        ///   Looks up a localized string similar to npm failed with exit code {0}.
         /// </summary>
         public static string npm_runner_failed_exit {
             get {
@@ -1020,6 +1020,24 @@ namespace Microsoft.CmdPal.UI.ViewModels.Properties {
         public static string npm_runner_lockfile_untrusted {
             get {
                 return ResourceManager.GetString("npm_runner_lockfile_untrusted", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to The install was blocked because the package does not include a published npm-shrinkwrap.json. Command Palette only installs packages whose publisher has frozen the full dependency tree.
+        /// </summary>
+        public static string npm_runner_shrinkwrap_required {
+            get {
+                return ResourceManager.GetString("npm_runner_shrinkwrap_required", resourceCulture);
+            }
+        }
+
+        /// <summary>
+        ///   Looks up a localized string similar to The install was blocked because the downloaded package could not be read.
+        /// </summary>
+        public static string npm_runner_extract_failed {
+            get {
+                return ResourceManager.GetString("npm_runner_extract_failed", resourceCulture);
             }
         }
 
