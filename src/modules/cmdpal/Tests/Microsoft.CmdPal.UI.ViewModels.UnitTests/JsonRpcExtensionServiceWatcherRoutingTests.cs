@@ -155,6 +155,70 @@ public class JsonRpcExtensionServiceWatcherRoutingTests
         Assert.IsFalse(JsonRpcExtensionService.ManifestChanged(loaded, null!));
     }
 
+    // r3-p4-02: the recursive root watcher reports every descendant path. Only a top-level
+    // <root>/<extdir> directory or its own <root>/<extdir>/package.json manifest is an
+    // extension entry; anything deeper (a nested package or a node_modules manifest) must be
+    // ignored so a nested package.json is not treated as an extension upsert.
+    [TestMethod]
+    public void IsTopLevelExtensionChange_ExtensionDirectory_IsTrue()
+    {
+        Assert.IsTrue(JsonRpcExtensionService.IsTopLevelExtensionChange(@"C:\root", @"C:\root\my-extension"));
+    }
+
+    [TestMethod]
+    public void IsTopLevelExtensionChange_TopLevelManifest_IsTrue()
+    {
+        Assert.IsTrue(JsonRpcExtensionService.IsTopLevelExtensionChange(@"C:\root", @"C:\root\my-extension\package.json"));
+    }
+
+    [TestMethod]
+    public void IsTopLevelExtensionChange_NestedManifest_IsFalse()
+    {
+        // A package.json inside a nested package or under node_modules is two-plus levels
+        // below the extension directory and is not an extension entry.
+        Assert.IsFalse(JsonRpcExtensionService.IsTopLevelExtensionChange(
+            @"C:\root", Path.Combine(@"C:\root", "my-extension", "node_modules", "dep", "package.json")));
+
+        Assert.IsFalse(JsonRpcExtensionService.IsTopLevelExtensionChange(
+            @"C:\root", Path.Combine(@"C:\root", "my-extension", "packages", "inner", "package.json")));
+    }
+
+    [TestMethod]
+    public void IsTopLevelExtensionChange_NestedDirectory_IsFalse()
+    {
+        Assert.IsFalse(JsonRpcExtensionService.IsTopLevelExtensionChange(
+            @"C:\root", Path.Combine(@"C:\root", "my-extension", "dist")));
+    }
+
+    [TestMethod]
+    public void IsTopLevelExtensionChange_NonManifestTopLevelFile_IsFalse()
+    {
+        // A file that sits at <root>/<extdir>/<file> but is not the manifest is not an entry.
+        Assert.IsFalse(JsonRpcExtensionService.IsTopLevelExtensionChange(
+            @"C:\root", Path.Combine(@"C:\root", "my-extension", "index.js")));
+    }
+
+    [TestMethod]
+    public void IsTopLevelExtensionChange_OutsideRoot_IsFalse()
+    {
+        Assert.IsFalse(JsonRpcExtensionService.IsTopLevelExtensionChange(@"C:\root", @"C:\other\my-extension\package.json"));
+        Assert.IsFalse(JsonRpcExtensionService.IsTopLevelExtensionChange(@"C:\root", @"C:\root"));
+    }
+
+    [TestMethod]
+    public void IsTopLevelExtensionChange_ForwardSlashesAndCasing_AreHonored()
+    {
+        Assert.IsTrue(JsonRpcExtensionService.IsTopLevelExtensionChange("C:/root", "C:/root/my-extension/Package.json"));
+        Assert.IsFalse(JsonRpcExtensionService.IsTopLevelExtensionChange("C:/root", "C:/root/my-extension/node_modules/dep/package.json"));
+    }
+
+    [TestMethod]
+    public void IsTopLevelExtensionChange_Empty_IsFalse()
+    {
+        Assert.IsFalse(JsonRpcExtensionService.IsTopLevelExtensionChange(string.Empty, @"C:\root\ext"));
+        Assert.IsFalse(JsonRpcExtensionService.IsTopLevelExtensionChange(@"C:\root", string.Empty));
+    }
+
     private static JSExtensionManifest SampleManifest() => new()
     {
         Name = "my-extension",

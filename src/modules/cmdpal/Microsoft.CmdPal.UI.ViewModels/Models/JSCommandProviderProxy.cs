@@ -265,26 +265,38 @@ public sealed partial class JSCommandProviderProxy : ICommandProvider, IDisposab
     {
         lock (_hostLock)
         {
-            if (_isDisposed)
-            {
-                return;
-            }
-
-            var host = _host;
-            if (host is null)
-            {
-                _pendingHostActions.Add(action);
-                return;
-            }
-
-            // Invoke the host action while holding the lock so status show and hide calls
-            // run in the same order as their lock acquisition. Host status methods are
-            // fire-and-forget (they return an async operation immediately), so the lock is
-            // held only briefly. This keeps a hide from being reordered ahead of a late
-            // show, and, because Dispose sets _isDisposed under this same lock, keeps a show
-            // from resurrecting status after teardown has hidden everything.
-            action(host);
+            RunWithHostLocked(action);
         }
+    }
+
+    /// <summary>
+    /// Variant of <see cref="RunWithHost"/> that requires <see cref="_hostLock"/> to already
+    /// be held by the caller. Status show and hide handlers call this from inside the same
+    /// lock acquisition that mutates <see cref="_shownStatusMessages"/> so the dictionary
+    /// update and the host dispatch are a single atomic, ordered step. Splitting them across
+    /// two lock acquisitions would let a hide dispatch overtake its pending show.
+    /// </summary>
+    private void RunWithHostLocked(Action<IExtensionHost> action)
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        var host = _host;
+        if (host is null)
+        {
+            _pendingHostActions.Add(action);
+            return;
+        }
+
+        // Invoke the host action while holding the lock so status show and hide calls
+        // run in the same order as their lock acquisition. Host status methods are
+        // fire-and-forget (they return an async operation immediately), so the lock is
+        // held only briefly. This keeps a hide from being reordered ahead of a late
+        // show, and, because Dispose sets _isDisposed under this same lock, keeps a show
+        // from resurrecting status after teardown has hidden everything.
+        action(host);
     }
 
     public void Dispose()
@@ -538,9 +550,11 @@ public sealed partial class JSCommandProviderProxy : ICommandProvider, IDisposab
                 {
                     _shownStatusMessages[statusId] = statusMessage;
                 }
-            }
 
-            RunWithHost(host => _ = host.ShowStatus(statusMessage, context));
+                // Dispatch inside the same lock acquisition that recorded the status so the
+                // show cannot be reordered behind a hide that arrives immediately after.
+                RunWithHostLocked(host => _ = host.ShowStatus(statusMessage, context));
+            }
         }
         catch (Exception ex)
         {
@@ -563,7 +577,6 @@ public sealed partial class JSCommandProviderProxy : ICommandProvider, IDisposab
                 return;
             }
 
-            StatusMessage? statusMessage = null;
             lock (_hostLock)
             {
                 if (_isDisposed)
@@ -577,11 +590,11 @@ public sealed partial class JSCommandProviderProxy : ICommandProvider, IDisposab
                 }
 
                 _shownStatusMessages.Remove(statusId);
-                statusMessage = existing;
-            }
 
-            var toHide = statusMessage!;
-            RunWithHost(host => _ = host.HideStatus(toHide));
+                // Dispatch inside the same lock acquisition that removed the status so the
+                // hide observes the same ordering as the show that preceded it.
+                RunWithHostLocked(host => _ = host.HideStatus(existing));
+            }
         }
         catch (Exception ex)
         {

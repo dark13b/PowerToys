@@ -44,6 +44,7 @@ public sealed partial class JSExtensionWrapper : IExtensionWrapper, IDisposable
     private Process? _nodeProcess;
     private JsonRpcConnection? _connection;
     private JSCommandProviderProxy? _commandProviderProxy;
+    private Task? _startInProgress;
     private bool _isDisposed;
     private bool _stopping;
     private int _consecutiveCrashCount;
@@ -187,41 +188,72 @@ public sealed partial class JSExtensionWrapper : IExtensionWrapper, IDisposable
     {
         lock (_lock)
         {
-            if (_nodeProcess is null || _connection is null)
+            return IsRunningLocked();
+        }
+    }
+
+    private bool IsRunningLocked()
+    {
+        if (_nodeProcess is null || _connection is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            return !_nodeProcess.HasExited;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    public Task StartExtensionAsync()
+    {
+        lock (_lock)
+        {
+            ObjectDisposedException.ThrowIf(_isDisposed, this);
+
+            if (IsRunningLocked())
             {
-                return false;
+                return Task.CompletedTask;
             }
 
-            try
+            // Single-flight: a concurrent caller (for example GetProviderAsync calling in
+            // right after the service starts the wrapper) joins the in-progress start
+            // instead of spawning a second Node process. The start body runs on the thread
+            // pool so no process is spawned while this lock is held; the task is cleared
+            // when it completes so a later restart can start again.
+            _startInProgress ??= Task.Run(RunStartAsync);
+            return _startInProgress;
+        }
+    }
+
+    private async Task RunStartAsync()
+    {
+        try
+        {
+            await StartCoreAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_lock)
             {
-                return !_nodeProcess.HasExited;
-            }
-            catch (InvalidOperationException)
-            {
-                return false;
+                _startInProgress = null;
             }
         }
     }
 
-    public async Task StartExtensionAsync()
+    private async Task StartCoreAsync()
     {
-        ObjectDisposedException.ThrowIf(_isDisposed, this);
-
         lock (_lock)
         {
-            if (_nodeProcess is not null && _connection is not null)
+            // The wrapper may have been disposed, or another start may have completed,
+            // between scheduling this start and running it.
+            if (_isDisposed || IsRunningLocked())
             {
-                try
-                {
-                    if (!_nodeProcess.HasExited)
-                    {
-                        return;
-                    }
-                }
-                catch (InvalidOperationException)
-                {
-                    // Process handle is no longer valid; fall through and restart.
-                }
+                return;
             }
         }
 
@@ -234,13 +266,27 @@ public sealed partial class JSExtensionWrapper : IExtensionWrapper, IDisposable
             return;
         }
 
+        // Launch through the Phase 1 SDK bootstrap when it is installed so the bootstrap
+        // claims stdout for the protocol before the extension entry is dynamically imported.
+        // The effective launch command is:
+        //   node [--inspect=<port>] "<bootstrap>" "<entry>"
+        // and, when the bootstrap cannot be resolved:
+        //   node [--inspect=<port>] "<entry>"
+        var bootstrapScript = ResolveBootstrapScript(_manifestDirectory);
+        if (bootstrapScript is null)
+        {
+            Logger.LogWarning(
+                $"Bootstrap loader not found for {_manifest.Name}; launching the entry directly. A stray top-level stdout write can corrupt the protocol until the SDK bootstrap is installed.");
+        }
+
         Process? nodeProcess = null;
+        JsonRpcConnection? connection = null;
         try
         {
             var psi = new ProcessStartInfo
             {
                 FileName = "node",
-                Arguments = BuildNodeArguments(entryPoint),
+                Arguments = BuildNodeArguments(entryPoint, bootstrapScript),
                 UseShellExecute = false,
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,
@@ -256,7 +302,7 @@ public sealed partial class JSExtensionWrapper : IExtensionWrapper, IDisposable
                 return;
             }
 
-            var connection = new JsonRpcConnection(
+            connection = new JsonRpcConnection(
                 nodeProcess.StandardOutput.BaseStream,
                 nodeProcess.StandardInput.BaseStream,
                 nodeProcess.StandardError.BaseStream);
@@ -264,17 +310,34 @@ public sealed partial class JSExtensionWrapper : IExtensionWrapper, IDisposable
             connection.Error += OnConnectionError;
             connection.Disconnected += OnConnectionDisconnected;
 
+            var disposedDuringStart = false;
             lock (_lock)
             {
-                _stopping = false;
-                _nodeProcess = nodeProcess;
-                _connection = connection;
+                // If a dispose landed while the process was starting, do not resurrect the
+                // wrapper by assigning the fresh handles. Reap the just-started process
+                // below instead so it cannot leak past disposal.
+                if (_isDisposed || _stopping)
+                {
+                    disposedDuringStart = true;
+                }
+                else
+                {
+                    _nodeProcess = nodeProcess;
+                    _connection = connection;
 
-                // Create the provider proxy before the initialize handshake so its host
-                // notification handlers are registered in time to receive notifications
-                // (logs, statuses, clipboard requests, items-changed) that the extension
-                // emits while it activates during initialize.
-                _commandProviderProxy = new JSCommandProviderProxy(connection, _manifest);
+                    // Create the provider proxy before the initialize handshake so its host
+                    // notification handlers are registered in time to receive notifications
+                    // (logs, statuses, clipboard requests, items-changed) that the extension
+                    // emits while it activates during initialize.
+                    _commandProviderProxy = new JSCommandProviderProxy(connection, _manifest);
+                }
+            }
+
+            if (disposedDuringStart)
+            {
+                Logger.LogDebug($"JS extension {_manifest.Name} was disposed while starting; reaping the new process.");
+                ReapOrphanedStart(nodeProcess, connection);
+                return;
             }
 
             connection.StartListening();
@@ -330,6 +393,36 @@ public sealed partial class JSExtensionWrapper : IExtensionWrapper, IDisposable
 
             SignalDispose();
         }
+    }
+
+    private void ReapOrphanedStart(Process nodeProcess, JsonRpcConnection connection)
+    {
+        connection.Error -= OnConnectionError;
+        connection.Disconnected -= OnConnectionDisconnected;
+
+        try
+        {
+            connection.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug($"Error disposing orphaned connection for {_manifest.Name}: {ex.Message}");
+        }
+
+        try
+        {
+            if (!nodeProcess.HasExited)
+            {
+                nodeProcess.Kill(entireProcessTree: true);
+                nodeProcess.WaitForExit(2000);
+            }
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            // Best effort.
+        }
+
+        nodeProcess.Dispose();
     }
 
     public void SignalDispose()
@@ -392,7 +485,7 @@ public sealed partial class JSExtensionWrapper : IExtensionWrapper, IDisposable
 
         lock (_lock)
         {
-            if (_connection is null || !IsRunning())
+            if (_connection is null || !IsRunningLocked())
             {
                 return null;
             }
@@ -602,15 +695,121 @@ public sealed partial class JSExtensionWrapper : IExtensionWrapper, IDisposable
         }
     }
 
-    private string BuildNodeArguments(string entryPoint)
+    private string BuildNodeArguments(string entryPoint, string? bootstrapScript)
     {
+        // node [--inspect=<port>] "<bootstrap>" "<entry>" when the bootstrap resolves,
+        // otherwise node [--inspect=<port>] "<entry>". The bootstrap reads the entry from
+        // process.argv[2]; Node runtime flags such as --inspect never enter process.argv,
+        // so the entry stays at argv[2] regardless of debug mode.
+        var target = bootstrapScript is null
+            ? $"\"{entryPoint}\""
+            : $"\"{bootstrapScript}\" \"{entryPoint}\"";
+
         if (_manifest.Debug)
         {
             var port = _manifest.DebugPort ?? Interlocked.Increment(ref _nextDebugPort);
             Logger.LogInfo($"Debug mode enabled for {_manifest.Name} on inspector port {port}");
-            return $"--inspect={port} \"{entryPoint}\"";
+            return $"--inspect={port} {target}";
         }
 
-        return $"\"{entryPoint}\"";
+        return target;
+    }
+
+    /// <summary>
+    /// Resolves the Phase 1 SDK bootstrap loader for an installed extension. The bootstrap
+    /// claims and guards stdout before it dynamically imports the extension entry, so a
+    /// static top-level stdout write cannot corrupt the JSON-RPC framing. Resolution is
+    /// relative to the extension's installed SDK
+    /// (<c>&lt;manifestDirectory&gt;/node_modules/@microsoft/cmdpal-sdk</c>), preferring the
+    /// package's declared <c>bin</c> entry and falling back to the known published
+    /// artifacts. Returns <see langword="null"/> when the SDK or its bootstrap is not present.
+    /// </summary>
+    internal static string? ResolveBootstrapScript(string manifestDirectory)
+    {
+        if (string.IsNullOrEmpty(manifestDirectory))
+        {
+            return null;
+        }
+
+        var sdkRoot = Path.Combine(manifestDirectory, "node_modules", "@microsoft", "cmdpal-sdk");
+        if (!Directory.Exists(sdkRoot))
+        {
+            return null;
+        }
+
+        // Prefer the SDK package's declared bin entry so the launch tracks the published
+        // contract rather than a hardcoded artifact path.
+        var fromBin = ResolveBootstrapFromPackageJson(sdkRoot);
+        if (fromBin is not null && File.Exists(fromBin))
+        {
+            return fromBin;
+        }
+
+        foreach (var candidate in new[]
+        {
+            Path.Combine(sdkRoot, "dist", "runtime", "bootstrap.js"),
+            Path.Combine(sdkRoot, "bin", "cmdpal-bootstrap.mjs"),
+        })
+        {
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ResolveBootstrapFromPackageJson(string sdkRoot)
+    {
+        var packageJsonPath = Path.Combine(sdkRoot, "package.json");
+        if (!File.Exists(packageJsonPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(packageJsonPath));
+            if (!document.RootElement.TryGetProperty("bin", out var bin))
+            {
+                return null;
+            }
+
+            string? relative = null;
+            if (bin.ValueKind == JsonValueKind.String)
+            {
+                relative = bin.GetString();
+            }
+            else if (bin.ValueKind == JsonValueKind.Object)
+            {
+                if (bin.TryGetProperty("cmdpal-bootstrap", out var named) && named.ValueKind == JsonValueKind.String)
+                {
+                    relative = named.GetString();
+                }
+                else
+                {
+                    foreach (var property in bin.EnumerateObject())
+                    {
+                        if (property.Value.ValueKind == JsonValueKind.String)
+                        {
+                            relative = property.Value.GetString();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (string.IsNullOrEmpty(relative))
+            {
+                return null;
+            }
+
+            return Path.GetFullPath(Path.Combine(sdkRoot, relative));
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 }

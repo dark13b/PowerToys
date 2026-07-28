@@ -81,8 +81,18 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
 
     private readonly DirectoryLifecycleGate _directoryGate = new();
 
+    // Single ordered dispatch path for OnProviderAdded/OnProviderRemoved so consumers can
+    // never observe a provider addition before a removal that was raised ahead of it, even
+    // when the two originate on different threads.
+    private readonly SerialNotificationDispatcher _notifications = new();
+
     private FileSystemWatcher? _directoryWatcher;
     private bool _disposed;
+
+    // Set true, under _extensionsLock, once shutdown has cleared the collections. A start
+    // that completes after this point must not register its extension (which would leak a
+    // Node process and watcher past shutdown); it tears the fresh instance down instead.
+    private bool _shuttingDown;
 
     public JsonRpcExtensionService(TaskScheduler taskScheduler)
     {
@@ -120,6 +130,9 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
 
         /// <summary>Another directory already owns this extension's provider id.</summary>
         DuplicateId,
+
+        /// <summary>Shutdown began before the extension could be registered.</summary>
+        Stopping,
     }
 
     public async Task<IEnumerable<CommandProviderWrapper>> LoadProvidersAsync(CancellationToken ct)
@@ -132,6 +145,13 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
         // Begin a fresh load cycle. This replaces a token that a previous stop left
         // canceled, so a load after a stop actually runs.
         _reload.BeginCycle();
+
+        // A new load cycle clears the shutting-down guard so registrations are accepted
+        // again after a previous SignalStopAsync.
+        lock (_extensionsLock)
+        {
+            _shuttingDown = false;
+        }
 
         var sw = Stopwatch.StartNew();
 
@@ -182,6 +202,7 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
         List<JSExtensionWrapper> toStop;
         lock (_extensionsLock)
         {
+            _shuttingDown = true;
             toStop = [.. _extensions];
             _extensions.Clear();
             _providerWrappers.Clear();
@@ -225,7 +246,7 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
             var added = await AddDiscoveredNotLoadedAsync(CancellationToken.None).ConfigureAwait(false);
             foreach (var wrapper in added)
             {
-                OnProviderAdded?.Invoke(this, [wrapper]);
+                RaiseProviderAdded(wrapper);
             }
 
             // Reconcile out extensions whose directory no longer exists or no longer
@@ -243,7 +264,7 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
                 var removed = await RemoveExtensionByDirectoryGatedAsync(directory).ConfigureAwait(false);
                 if (removed is not null)
                 {
-                    OnProviderRemoved?.Invoke(this, [removed]);
+                    RaiseProviderRemoved(removed);
                 }
             }
 
@@ -336,6 +357,7 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
         List<JSExtensionWrapper> toDispose;
         lock (_extensionsLock)
         {
+            _shuttingDown = true;
             toDispose = [.. _extensions];
             _extensions.Clear();
             _providerWrappers.Clear();
@@ -349,6 +371,7 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
             ext.Dispose();
         }
 
+        _notifications.Dispose();
         _directoryGate.Dispose();
         _reload.Dispose();
     }
@@ -557,6 +580,59 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
         }
     }
 
+    /// <summary>
+    /// Returns true only when a watcher change under <paramref name="root"/> is a top-level
+    /// extension change: the extension directory itself (<c>&lt;root&gt;/&lt;extdir&gt;</c>) or its
+    /// own manifest (<c>&lt;root&gt;/&lt;extdir&gt;/package.json</c>). Anything deeper (a nested
+    /// package.json or a nested directory, for example under <c>node_modules</c> or a nested
+    /// package) returns false so the recursive root watcher does not treat it as an extension
+    /// upsert. Extracted as a pure helper so the depth filter can be tested without a live
+    /// watcher.
+    /// </summary>
+    /// <param name="root">The extensions root directory.</param>
+    /// <param name="fullPath">A path reported by the watcher.</param>
+    /// <returns>True when the change belongs to a top-level extension entry.</returns>
+    internal static bool IsTopLevelExtensionChange(string root, string fullPath)
+    {
+        if (string.IsNullOrEmpty(root) || string.IsNullOrEmpty(fullPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var normalizedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
+            var normalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(fullPath));
+
+            var prefix = normalizedRoot + Path.DirectorySeparatorChar;
+            if (!normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var relative = normalized[prefix.Length..];
+            var segments = relative.Split(
+                [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+                StringSplitOptions.RemoveEmptyEntries);
+
+            return segments.Length switch
+            {
+                // <root>/<extdir> (the extension directory created, renamed, or removed).
+                1 => true,
+
+                // <root>/<extdir>/package.json (the extension's own manifest).
+                2 => string.Equals(segments[1], "package.json", StringComparison.OrdinalIgnoreCase),
+
+                // Anything deeper is a nested file or directory and is not an extension entry.
+                _ => false,
+            };
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
     private static string GetDefaultExtensionsPath()
     {
         var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -652,6 +728,28 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
     }
 
     private bool IsStopping(CancellationToken ct) => _disposed || _reload.IsStopRequested || ct.IsCancellationRequested;
+
+    // Provider add/remove notifications are raised through a single ordered dispatcher so a
+    // consumer never observes an addition ahead of a removal that was raised before it.
+    private void RaiseProviderAdded(CommandProviderWrapper wrapper) =>
+        _notifications.Enqueue(() => OnProviderAdded?.Invoke(this, [wrapper]));
+
+    private void RaiseProviderRemoved(CommandProviderWrapper wrapper) =>
+        _notifications.Enqueue(() => OnProviderRemoved?.Invoke(this, [wrapper]));
+
+    // A swap (hot-reload or crash-restart) raises the removal of the old provider and the
+    // addition of the new one as one enqueued action so the pair can never be split, nor
+    // observed out of order, by another operation's emission.
+    private void RaiseProviderSwapped(CommandProviderWrapper? removed, CommandProviderWrapper added) =>
+        _notifications.Enqueue(() =>
+        {
+            if (removed is not null)
+            {
+                OnProviderRemoved?.Invoke(this, [removed]);
+            }
+
+            OnProviderAdded?.Invoke(this, [added]);
+        });
 
     private bool EnsureExtensionsDirectory()
     {
@@ -762,12 +860,15 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
     }
 
     /// <summary>
-    /// Starts an extension process and registers its provider. The caller must hold the
-    /// directory's lifecycle gate. Any wrapper created here that cannot be registered
-    /// (start failure, cancellation, or a defensive duplicate) is disposed so its process
+    /// Starts an extension process and returns a started-but-unregistered instance, or null
+    /// if the process could not start or does not provide an <see cref="ICommandProvider"/>.
+    /// The caller must hold the directory's lifecycle gate. This does not mutate the
+    /// service collections or reserve a provider id; it is the validate half of a
+    /// validate-then-swap so a hot-reload can start a replacement before removing the
+    /// incumbent. Any wrapper created here that fails validation is disposed so its process
     /// is not leaked.
     /// </summary>
-    private async Task<CommandProviderWrapper?> StartAndRegisterAsync(string directory, JSExtensionManifest manifest, bool resetCrashCount, CancellationToken ct)
+    private async Task<StartedInstance?> StartInstanceAsync(string directory, JSExtensionManifest manifest, CancellationToken ct)
     {
         if (IsStopping(ct))
         {
@@ -805,66 +906,7 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
             }
 
             var wrapper = new CommandProviderWrapper(extensionWrapper, provider, _taskScheduler);
-            extensionWrapper.ProcessExited += OnExtensionProcessExited;
-
-            var outcome = RegistrationOutcome.Added;
-            lock (_extensionsLock)
-            {
-                // The per-directory gate prevents concurrent loads for one directory, but
-                // keep the incumbent and drop the newcomer defensively rather than leaking
-                // two live processes if a duplicate ever slips through.
-                if (_extensions.Any(e => PathsEqual(e.ManifestDirectory, directory)))
-                {
-                    outcome = RegistrationOutcome.DuplicateDirectory;
-                }
-                else if (!_providerIds.TryReserve(extensionWrapper.NameKey, CanonicalKey(directory)))
-                {
-                    // Another directory already owns this provider id. Claiming the id and
-                    // adding to _extensions happen as one atomic step under this lock, so no
-                    // interleaving install, hot-reload, or crash-restart can register a
-                    // second provider with the same id.
-                    outcome = RegistrationOutcome.DuplicateId;
-                }
-                else
-                {
-                    _extensions.Add(extensionWrapper);
-                    _providerWrappers.Add(wrapper);
-                    if (resetCrashCount)
-                    {
-                        _crashCounts.Remove(CanonicalKey(directory));
-                    }
-                }
-            }
-
-            if (outcome != RegistrationOutcome.Added)
-            {
-                if (outcome == RegistrationOutcome.DuplicateId)
-                {
-                    Logger.LogWarning(
-                        $"Skipping JS extension at {directory}: provider id '{extensionWrapper.NameKey}' is already reserved by another extension.");
-                }
-
-                extensionWrapper.ProcessExited -= OnExtensionProcessExited;
-                extensionWrapper.SignalDispose();
-                return null;
-            }
-
-            StartSourceFileWatcher(directory);
-
-            // A process can exit immediately after init (for example a provider that faults
-            // on first use). If that exit fired before we subscribed to ProcessExited above,
-            // the event was missed; detect the dead process here and drive the same crash
-            // path so an immediate post-init crash is handled (restart or disable) instead
-            // of being registered as healthy. The handler runs on a separate task so it
-            // acquires the directory gate only after this registration releases it, and it is
-            // idempotent, so racing the real event is harmless.
-            if (!extensionWrapper.IsRunning())
-            {
-                OnExtensionProcessExited(extensionWrapper, EventArgs.Empty);
-            }
-
-            Logger.LogInfo($"Loaded JS extension: {manifest.EffectiveDisplayName}");
-            return wrapper;
+            return new StartedInstance(extensionWrapper, wrapper);
         }
         catch (Exception ex)
         {
@@ -873,6 +915,98 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
             return null;
         }
     }
+
+    /// <summary>
+    /// Starts an extension process and registers its provider. The caller must hold the
+    /// directory's lifecycle gate. Any wrapper created here that cannot be registered
+    /// (start failure, cancellation, shutdown, or a defensive duplicate) is disposed so its
+    /// process is not leaked.
+    /// </summary>
+    private async Task<CommandProviderWrapper?> StartAndRegisterAsync(string directory, JSExtensionManifest manifest, bool resetCrashCount, CancellationToken ct)
+    {
+        var instance = await StartInstanceAsync(directory, manifest, ct).ConfigureAwait(false);
+        if (instance is null)
+        {
+            return null;
+        }
+
+        var extensionWrapper = instance.Extension;
+        var wrapper = instance.Wrapper;
+        extensionWrapper.ProcessExited += OnExtensionProcessExited;
+
+        var outcome = RegistrationOutcome.Added;
+        lock (_extensionsLock)
+        {
+            // Shutdown cleared the collections while this process was starting; do not
+            // register it, or its Node process and watcher would leak past shutdown.
+            if (_shuttingDown)
+            {
+                outcome = RegistrationOutcome.Stopping;
+            }
+
+            // The per-directory gate prevents concurrent loads for one directory, but
+            // keep the incumbent and drop the newcomer defensively rather than leaking
+            // two live processes if a duplicate ever slips through.
+            else if (_extensions.Any(e => PathsEqual(e.ManifestDirectory, directory)))
+            {
+                outcome = RegistrationOutcome.DuplicateDirectory;
+            }
+            else if (!_providerIds.TryReserve(extensionWrapper.NameKey, CanonicalKey(directory)))
+            {
+                // Another directory already owns this provider id. Claiming the id and
+                // adding to _extensions happen as one atomic step under this lock, so no
+                // interleaving install, hot-reload, or crash-restart can register a
+                // second provider with the same id.
+                outcome = RegistrationOutcome.DuplicateId;
+            }
+            else
+            {
+                _extensions.Add(extensionWrapper);
+                _providerWrappers.Add(wrapper);
+                if (resetCrashCount)
+                {
+                    _crashCounts.Remove(CanonicalKey(directory));
+                }
+            }
+        }
+
+        if (outcome != RegistrationOutcome.Added)
+        {
+            if (outcome == RegistrationOutcome.DuplicateId)
+            {
+                Logger.LogWarning(
+                    $"Skipping JS extension at {directory}: provider id '{extensionWrapper.NameKey}' is already reserved by another extension.");
+            }
+
+            extensionWrapper.ProcessExited -= OnExtensionProcessExited;
+            extensionWrapper.SignalDispose();
+            return null;
+        }
+
+        StartSourceFileWatcher(directory);
+
+        // A process can exit immediately after init (for example a provider that faults
+        // on first use). If that exit fired before we subscribed to ProcessExited above,
+        // the event was missed; detect the dead process here and drive the same crash
+        // path so an immediate post-init crash is handled (restart or disable) instead
+        // of being registered as healthy. The handler runs on a separate task so it
+        // acquires the directory gate only after this registration releases it, and it is
+        // idempotent, so racing the real event is harmless.
+        if (!extensionWrapper.IsRunning())
+        {
+            OnExtensionProcessExited(extensionWrapper, EventArgs.Empty);
+        }
+
+        Logger.LogInfo($"Loaded JS extension: {manifest.EffectiveDisplayName}");
+        return wrapper;
+    }
+
+    /// <summary>
+    /// An extension that has started and validated (its process is running and it provides
+    /// an <see cref="ICommandProvider"/>) but has not yet been registered into the service
+    /// collections. Used by the validate-then-swap hot-reload path.
+    /// </summary>
+    private sealed record StartedInstance(JSExtensionWrapper Extension, CommandProviderWrapper Wrapper);
 
     private void OnExtensionProcessExited(object? sender, EventArgs e)
     {
@@ -937,7 +1071,7 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
 
             if (removed is not null)
             {
-                OnProviderRemoved?.Invoke(this, [removed]);
+                RaiseProviderRemoved(removed);
             }
 
             if (DecideCrashAction(crashCount, MaxRestartAttempts) == CrashAction.Disable)
@@ -965,7 +1099,7 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
             var restarted = await StartAndRegisterAsync(directory, parseResult.Manifest, resetCrashCount: false, _reload.Token).ConfigureAwait(false);
             if (restarted is not null)
             {
-                OnProviderAdded?.Invoke(this, [restarted]);
+                RaiseProviderAdded(restarted);
                 Logger.LogInfo($"Restarted JS extension: {parseResult.Manifest.EffectiveDisplayName}");
             }
         }
@@ -1066,6 +1200,15 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
             return;
         }
 
+        // The root watcher is recursive, so it also reports nested files and directories.
+        // Only a top-level <root>/<extdir> directory or its own <root>/<extdir>/package.json
+        // is an extension change; a nested package.json or directory (a nested package or
+        // dependency) must not be treated as an extension upsert.
+        if (!IsTopLevelExtensionChange(ExtensionsPath, e.FullPath))
+        {
+            return;
+        }
+
         // Only manifests and (newly created) directories drive discovery here; source
         // file edits are handled by the per-extension source watcher.
         if (IsManifestPath(e.FullPath) || Directory.Exists(e.FullPath))
@@ -1079,7 +1222,11 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
         // A rename can be an atomic promotion (temp -> final) or a demotion/uninstall
         // (final -> temp). Treat the new name as a possible install and the old name as
         // a possible removal, ignoring either side that sits under an ignored segment.
-        if (!HasIgnoredDirectorySegment(e.FullPath) && (IsManifestPath(e.FullPath) || Directory.Exists(e.FullPath)))
+        // The new name must also be a top-level extension entry (directory or its own
+        // manifest); a nested rename is not an extension change.
+        if (!HasIgnoredDirectorySegment(e.FullPath)
+            && IsTopLevelExtensionChange(ExtensionsPath, e.FullPath)
+            && (IsManifestPath(e.FullPath) || Directory.Exists(e.FullPath)))
         {
             HandleDirectoryEntryUpsert(e.FullPath);
         }
@@ -1142,7 +1289,7 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
                 var wrapper = await AddExtensionGatedAsync(extensionDirectory, manifest, token).ConfigureAwait(false);
                 if (wrapper is not null)
                 {
-                    OnProviderAdded?.Invoke(this, [wrapper]);
+                    RaiseProviderAdded(wrapper);
                 }
             },
             token);
@@ -1171,7 +1318,7 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
                 var removed = await RemoveExtensionByDirectoryGatedAsync(extensionDirectory).ConfigureAwait(false);
                 if (removed is not null)
                 {
-                    OnProviderRemoved?.Invoke(this, [removed]);
+                    RaiseProviderRemoved(removed);
                 }
             },
             token);
@@ -1350,6 +1497,10 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
 
             _sourceFileWatchers.Clear();
         }
+
+        // Advance the debounce generation so a pending hot-reload callback that was already
+        // queued before this stop is dropped instead of firing against the next load cycle.
+        _hotReloadDebouncer.CancelAll();
     }
 
     private void OnSourceFileChanged(object sender, FileSystemEventArgs e)
@@ -1467,24 +1618,103 @@ public sealed partial class JsonRpcExtensionService : IExtensionService, IDispos
 
         using (gate)
         {
-            // Recreate the extension so the provider proxy rebinds to a fresh JSON-RPC
-            // connection. A developer-driven source edit is a fresh start, so the crash
-            // counter is reset on the successful load below. The gate entry is preserved
-            // because the directory itself is not being uninstalled.
-            var removed = RemoveExtensionByDirectoryCore(directory);
-            if (removed is not null)
+            // Validate-then-swap. Start the replacement FIRST, before removing the
+            // incumbent, so a failed reload keeps the incumbent provider (and its source
+            // watcher) live and a later corrective edit re-triggers this reload. The old
+            // provider is only removed once the new one has started and registered, so a
+            // duplicate-id refresh never leaves the directory with neither provider.
+            var replacement = await StartInstanceAsync(directory, parseResult.Manifest, _reload.Token).ConfigureAwait(false);
+            if (replacement is null)
             {
-                OnProviderRemoved?.Invoke(this, [removed]);
-            }
-
-            var wrapper = await StartAndRegisterAsync(directory, parseResult.Manifest, resetCrashCount: true, _reload.Token).ConfigureAwait(false);
-            if (wrapper is null)
-            {
-                Logger.LogError($"Hot-reload failed: {parseResult.Manifest.EffectiveDisplayName} did not restart");
+                Logger.LogError(
+                    $"Hot-reload failed: {parseResult.Manifest.EffectiveDisplayName} did not restart; keeping the current instance.");
                 return;
             }
 
-            OnProviderAdded?.Invoke(this, [wrapper]);
+            var newExtension = replacement.Extension;
+            var newWrapper = replacement.Wrapper;
+            newExtension.ProcessExited += OnExtensionProcessExited;
+
+            JSExtensionWrapper? incumbentExtension = null;
+            CommandProviderWrapper? removedWrapper = null;
+            var swapped = false;
+            var key = CanonicalKey(directory);
+
+            lock (_extensionsLock)
+            {
+                if (!_shuttingDown)
+                {
+                    // Remove the incumbent from the collections and release its provider id
+                    // so the replacement can claim it.
+                    incumbentExtension = _extensions.FirstOrDefault(e => PathsEqual(e.ManifestDirectory, directory));
+                    if (incumbentExtension is not null)
+                    {
+                        _extensions.Remove(incumbentExtension);
+                        removedWrapper = _providerWrappers.FirstOrDefault(w => ReferenceEquals(w.Extension, incumbentExtension));
+                        if (removedWrapper is not null)
+                        {
+                            _providerWrappers.Remove(removedWrapper);
+                        }
+
+                        _providerIds.Release(incumbentExtension.NameKey, key);
+                    }
+
+                    if (_providerIds.TryReserve(newExtension.NameKey, key))
+                    {
+                        _extensions.Add(newExtension);
+                        _providerWrappers.Add(newWrapper);
+                        _crashCounts.Remove(key);
+                        swapped = true;
+                    }
+                    else if (incumbentExtension is not null)
+                    {
+                        // The replacement's provider id is owned by a different directory.
+                        // Restore the incumbent so the reload does not lose both providers.
+                        _providerIds.TryReserve(incumbentExtension.NameKey, key);
+                        _extensions.Add(incumbentExtension);
+                        if (removedWrapper is not null)
+                        {
+                            _providerWrappers.Add(removedWrapper);
+                        }
+                    }
+                }
+            }
+
+            if (!swapped)
+            {
+                // The swap did not happen (shutdown, or the new provider id collided).
+                // Tear down the freshly started replacement and keep the incumbent, which
+                // is either still registered (restored above) or being torn down by
+                // shutdown. Its source watcher was never stopped, so a later edit reloads.
+                newExtension.ProcessExited -= OnExtensionProcessExited;
+                newExtension.SignalDispose();
+                Logger.LogWarning(
+                    $"Hot-reload for {parseResult.Manifest.EffectiveDisplayName} could not register the new instance; keeping the previous one.");
+                return;
+            }
+
+            // The source watcher for this directory was never stopped, so it is preserved
+            // across the reload; ensure one exists for the case where the incumbent had none.
+            StartSourceFileWatcher(directory);
+
+            // Dispose the incumbent only after the replacement is registered, so there is
+            // never a window with no provider for this directory.
+            if (incumbentExtension is not null)
+            {
+                incumbentExtension.ProcessExited -= OnExtensionProcessExited;
+                incumbentExtension.SignalDispose();
+            }
+
+            // Emit the removal and addition as a single ordered pair so consumers observe
+            // the swap in a consistent order.
+            RaiseProviderSwapped(removedWrapper, newWrapper);
+
+            // Catch an immediate post-init exit the same way the initial registration does.
+            if (!newExtension.IsRunning())
+            {
+                OnExtensionProcessExited(newExtension, EventArgs.Empty);
+            }
+
             Logger.LogInfo($"Hot-reload completed for {parseResult.Manifest.EffectiveDisplayName}");
         }
     }

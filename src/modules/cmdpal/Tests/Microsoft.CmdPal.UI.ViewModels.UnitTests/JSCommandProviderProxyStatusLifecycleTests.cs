@@ -94,4 +94,29 @@ public class JSCommandProviderProxyStatusLifecycleTests
 
         provider.Dispose();
     }
+
+    // r3-p4-06: a hide must never be observed by the host before the show it cancels. The
+    // handlers dispatch to the host inside the same lock acquisition that mutates the status
+    // map, so a hide cannot overtake a pending show. Caveat: the underlying defect is a
+    // cross-thread timing race (the show arrives on the notification worker while a hide can
+    // arrive from disconnect or dispose); this is a best-effort deterministic guard that
+    // asserts the host observes show-before-hide and ends with the status cleared.
+    [TestMethod]
+    public async Task ShowThenHide_SameId_HostObservesShowBeforeHide()
+    {
+        using var fake = new JSFakeExtension();
+        var provider = CreateInitialized(fake, out var host);
+
+        await fake.PushNotificationAsync("host/showStatus", ShowStatus("s1", "Live", 0));
+        await fake.PushNotificationAsync("host/hideStatus", new JsonObject { ["statusId"] = "s1" });
+
+        await host.WaitForShownCountAsync(1);
+        await host.WaitForHiddenCountAsync(1);
+
+        Assert.AreEqual(1, host.Shown.Count);
+        Assert.AreEqual(1, host.Hidden.Count);
+        Assert.AreSame(host.Shown[0], host.Hidden[0], "The hidden status must be the one that was shown.");
+
+        provider.Dispose();
+    }
 }

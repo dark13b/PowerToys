@@ -21,6 +21,12 @@ internal sealed partial class HotReloadDebouncer : IDisposable
     private readonly Dictionary<string, Timer> _timers = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
 
+    // Monotonic load generation. A timer captures the generation current when it is
+    // (re)armed; when the service stops it advances the generation so a callback that was
+    // already queued before the stop is dropped instead of firing a hot-reload against the
+    // next load generation.
+    private long _generation;
+
     /// <summary>
     /// Initializes a new instance of the <see cref="HotReloadDebouncer"/> class.
     /// </summary>
@@ -74,7 +80,11 @@ internal sealed partial class HotReloadDebouncer : IDisposable
                 return;
             }
 
-            _timers[key] = new Timer(OnTimerElapsed, key, _delay, Timeout.InfiniteTimeSpan);
+            // Capture the current generation so a callback that fires after a stop, but
+            // whose timer was armed before it, is dropped. A stop clears the timer map, so
+            // any timer found in the map above was armed in the current generation.
+            var state = new PendingReload(key, _generation);
+            _timers[key] = new Timer(OnTimerElapsed, state, _delay, Timeout.InfiniteTimeSpan);
         }
     }
 
@@ -91,6 +101,31 @@ internal sealed partial class HotReloadDebouncer : IDisposable
                 timer.Dispose();
                 _timers.Remove(key);
             }
+        }
+    }
+
+    /// <summary>
+    /// Cancels every pending debounce and advances the load generation. Callbacks whose
+    /// timer was armed before this call are dropped even if they had already been queued to
+    /// the thread pool, so a hot-reload notified in a prior generation cannot fire against
+    /// the next one. Used when the service stops between load cycles.
+    /// </summary>
+    public void CancelAll()
+    {
+        lock (_lock)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _generation++;
+            foreach (var timer in _timers.Values)
+            {
+                timer.Dispose();
+            }
+
+            _timers.Clear();
         }
     }
 
@@ -115,7 +150,7 @@ internal sealed partial class HotReloadDebouncer : IDisposable
 
     private void OnTimerElapsed(object? state)
     {
-        var key = (string)state!;
+        var pending = (PendingReload)state!;
 
         lock (_lock)
         {
@@ -124,13 +159,22 @@ internal sealed partial class HotReloadDebouncer : IDisposable
                 return;
             }
 
-            if (_timers.TryGetValue(key, out var timer))
+            // Drop a callback captured in an earlier generation (the service stopped after
+            // this timer was armed), so it cannot drive a reload in the current generation.
+            if (pending.Generation != _generation)
+            {
+                return;
+            }
+
+            if (_timers.TryGetValue(pending.Key, out var timer))
             {
                 timer.Dispose();
-                _timers.Remove(key);
+                _timers.Remove(pending.Key);
             }
         }
 
-        _callback(key);
+        _callback(pending.Key);
     }
+
+    private readonly record struct PendingReload(string Key, long Generation);
 }
