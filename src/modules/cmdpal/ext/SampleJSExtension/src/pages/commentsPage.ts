@@ -48,10 +48,19 @@ const postTemplate = JSON.stringify({
  * A single post in the comment tree. Mirrors the C# `PostContent`/`PostForm`.
  *
  * Each post owns a stable `formId` so the host can route a reply submission back
- * to this exact post even though the post's form lives deep in a lazily expanded
+ * to this exact post even though the post's form lives deep in a lazily authored
  * tree. The ids are minted once per post instance, and the page keeps its post
- * instances alive (see `SampleCommentsPage`), so a reply pushed onto a post is
- * shown the next time that branch of the tree is expanded.
+ * instances alive (see `SampleCommentsPage`), so a reply added to a post is
+ * retained on the model.
+ *
+ * Note on refresh: a content page's tree is serialized in full when the host
+ * calls `contentPage/getContent`, and the host does not re-fetch that content in
+ * response to a form submit (the content-page proxy exposes no live
+ * `ItemsChanged` channel, and expanding a tree branch does not re-query the
+ * extension). A reply therefore does not appear in the thread that is already on
+ * screen; it shows up the next time the page's content is loaded, which happens
+ * when the user navigates away and reopens the page. This sample is deliberately
+ * honest about that rather than claiming an on-screen refresh it cannot perform.
  */
 class Post implements TreeContent {
   readonly type = 'tree';
@@ -85,7 +94,11 @@ class Post implements TreeContent {
           const reply = parsed.ReplyBody;
           if (reply) {
             this.replies.push(new Post(reply));
-            ExtensionHost.showStatus('Reply posted', 'success');
+            // The reply is saved to the model, but the thread already on screen
+            // is not re-fetched (see the class note above), so the status is
+            // honest about when it will be visible instead of implying a live
+            // refresh.
+            ExtensionHost.showStatus('Reply saved. Reopen this page to see it.', 'success');
           }
         } catch {
           // Ignore malformed form payloads.

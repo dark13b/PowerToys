@@ -85,9 +85,18 @@ CmdPal discovers extensions by finding directories with a `package.json` that co
 
 ### Validation Rules
 
-A `package.json` is recognized as a CmdPal extension if:
-1. It contains a `cmdpal` object (even if empty: `"cmdpal": {}`)
-2. `name` is present and non-empty
+CmdPal parses each `package.json` and only loads the directory as an extension when every rule below passes. A failure is fatal for that extension: the directory is skipped (during discovery) or the install is rejected (from the gallery), and the reason is logged. The rules are enforced in `JSExtensionManifest.TryParse`.
+
+1. **`cmdpal` object present.** The manifest must contain a `cmdpal` object (even if empty: `"cmdpal": {}`).
+2. **`name` present.** The top-level `name` must be present and non-empty.
+3. **Entry point declared.** `cmdpal.main` (preferred) or the top-level `main` must specify an entry point. If both are missing or blank, the extension is rejected.
+4. **Entry point stays inside the extension.** The entry point must be a **relative** path (a rooted or absolute path is rejected) that resolves to a location **inside** the extension directory. A path that escapes the directory with `..` is rejected so an extension cannot point its entry point at a file outside its own folder.
+5. **Entry point is a JavaScript module.** The resolved entry point must end in `.js`, `.mjs`, or `.cjs`. Any other extension (for example an uncompiled `.ts` source) is rejected, because the host runs the file directly with `node`.
+6. **Entry point exists.** The resolved entry point must be an existing file on disk. A `main` that points at a file that was never built or shipped is rejected.
+7. **No symlink or junction escape.** After confirming the file exists, the resolved entry point is re-checked against the real filesystem: a symbolic link, junction, or other reparse point that redirects the entry point outside the extension directory is rejected, even when the lexical path (rule 4) stayed inside it.
+
+A resolved relative icon (`cmdpal.icon`) is subject to the same containment rules; see [Icon resolution](#icon-resolution).
+
 ### Icon resolution
 
 The `cmdpal.icon` value is interpreted as follows:
@@ -245,25 +254,39 @@ With a junction link, changes to your source files are reflected immediately (af
 
 Registry distribution of `@microsoft/cmdpal-sdk` is **not yet supported**: the SDK
 is not published to a public npm registry, so a published package cannot depend on
-it by version. Until the SDK is published, a production extension must **bundle** the
-SDK into its own output rather than declaring it as an installed dependency.
+it by version. The way you reference the SDK differs between local development and
+gallery submission, and getting this wrong is the most common reason a package fails
+to install from the gallery.
 
-Two supported approaches:
+**Local development.** Reference the in-repo SDK directly with
+`"@microsoft/cmdpal-sdk": "file:../../ts-sdk"` (or `npm link`). This is convenient
+while iterating inside this repository, but it is **not** submittable to the gallery:
+a `file:` dependency resolves to a local path, not a registry URL, so it carries no
+integrity (SRI) hash and cannot appear in an `npm-shrinkwrap.json` as a verifiable,
+trusted entry. The gallery installer rejects any package whose dependency closure
+contains such an untrusted entry.
 
-1. **Bundle the SDK into `dist/`** (recommended). Use a bundler (for example,
-   `esbuild` or `rollup`) so the SDK is inlined into the files you ship under
-   `dist/`. The published package then has no runtime dependency on
-   `@microsoft/cmdpal-sdk`, and `npm install <your-package>` needs no access to this
-   repository.
-2. **Vendor a packed SDK tarball.** Run `npm pack` in `ts-sdk`, commit the resulting
-   `microsoft-cmdpal-sdk-<version>.tgz` alongside your extension, and reference it as
-   `"@microsoft/cmdpal-sdk": "file:./microsoft-cmdpal-sdk-<version>.tgz"`. This
-   installs on a machine that does not have the PowerToys repository.
+**Gallery submission.** The published package must not carry a `file:` dependency on
+the SDK. Two paths satisfy the gallery's trusted-lockfile rules:
 
-Do not ship a production package whose only path to the SDK is
-`"file:../../ts-sdk"`: that relative path exists only inside this repository, so the
-package cannot install anywhere else. That form is for **local development only** (see
-[Development Setup](#development-setup)).
+1. **Bundle the SDK into `dist/`** (required today, recommended). Use a bundler (for
+   example, `esbuild` or `rollup`) so the SDK is inlined into the files you ship under
+   `dist/`. The published package then has **no runtime dependency** on
+   `@microsoft/cmdpal-sdk` at all, so nothing about the SDK needs to appear in the
+   lockfile, and `npm install <your-package>` needs no access to this repository. This
+   is the only submittable path until the SDK is published to a registry.
+2. **Depend on the published SDK by version** (available once the SDK ships to a
+   trusted registry). Declare `"@microsoft/cmdpal-sdk": "<exact-version>"` under
+   `dependencies` so it resolves to a registry URL with an integrity hash and is frozen
+   in the embedded `npm-shrinkwrap.json` (see [Freezing the dependency
+   closure](#freezing-the-dependency-closure-npm-shrinkwrapjson)). Do **not** use a
+   vendored `file:` tarball (`file:./microsoft-cmdpal-sdk-<version>.tgz`) for
+   submission: like `file:../../ts-sdk`, it lacks a trusted registry URL and SRI and is
+   rejected.
+
+Do not ship a gallery package whose path to the SDK is any `file:` reference
+(`file:../../ts-sdk` or a vendored `.tgz`). Those forms are for **local development
+only** (see [Development Setup](#development-setup)); bundle the SDK instead.
 
 ### npm Package Structure
 
@@ -284,7 +307,7 @@ for a bundled production build:
   },
   "scripts": {
     "build": "tsc && esbuild dist/index.js --bundle --platform=node --format=esm --outfile=dist/index.js --allow-overwrite",
-    "prepublishOnly": "npm run build"
+    "prepack": "npm run build"
   },
   "files": [
     "dist/",
@@ -304,8 +327,17 @@ for a bundled production build:
 
 The SDK appears only under `devDependencies` because the build step inlines it into
 `dist/`. The shipped package therefore lists no runtime dependency on
-`@microsoft/cmdpal-sdk`. If you vendor a packed tarball instead of bundling, move the
-tarball reference into `dependencies` and include the `.tgz` in `files`.
+`@microsoft/cmdpal-sdk`.
+
+The build is wired to the **`prepack`** lifecycle hook, not `prepublishOnly`, on
+purpose. `npm pack` (which produces the tarball the gallery ultimately installs, and
+the tarball you validate below) runs `prepack` but does **not** run `prepublishOnly`;
+only `npm publish` runs `prepublishOnly`. Using `prepack` guarantees `dist/` is
+rebuilt whenever the tarball is assembled, whether you are validating locally or
+publishing, so a clean checkout can never pack a stale or missing `dist/`. The SDK
+itself takes the equivalent belt-and-suspenders approach: its `verify:pack` script
+runs `npm run build` explicitly before `npm pack` rather than trusting a publish-only
+hook.
 
 ### Validating a clean install
 
@@ -313,7 +345,7 @@ To confirm your package installs without the PowerToys repository present, pack 
 and install it into a throwaway directory:
 
 ```powershell
-npm pack                     # produces publisher-cmdpal-my-extension-1.0.0.tgz
+npm pack                     # runs the prepack build, then produces publisher-cmdpal-my-extension-1.0.0.tgz with dist/ inside
 $temp = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ("cmdpal-smoke-" + [guid]::NewGuid()))
 Copy-Item .\publisher-cmdpal-my-extension-1.0.0.tgz $temp
 Push-Location $temp
@@ -385,6 +417,36 @@ An install source that does not pin both `version` and `integrity` is **not inst
 
 The `type: "jsonrpc"` install source distinguishes JavaScript extensions from COM-based extensions.
 
+### Freezing the dependency closure (`npm-shrinkwrap.json`)
+
+Gallery submission requires the published package to embed an `npm-shrinkwrap.json`.
+The gallery installer rejects a package that does not ship one, because without it the
+transitive dependency closure is not frozen: a later publish of one of your
+dependencies could change the bytes that land on a user's machine, and there would be
+no lockfile pinning each dependency to an exact version, resolved registry URL, and
+integrity (SRI) hash. `npm-shrinkwrap.json` is npm's publishable lockfile (unlike
+`package-lock.json`, npm includes it in the tarball), so it travels with the package
+and lets the installer verify the whole closure against trusted registry entries.
+
+If you **bundle** the SDK into `dist/` (the path required today) your extension may
+have no runtime dependencies at all, but you must still ship an `npm-shrinkwrap.json`
+so the closure is explicitly frozen (an empty or dependency-free closure is still a
+verified one).
+
+To create and maintain it:
+
+```powershell
+npm install          # resolve the exact dependency tree into package-lock.json
+npm shrinkwrap       # rename/convert it to a publishable npm-shrinkwrap.json
+```
+
+Then commit `npm-shrinkwrap.json` and publish as usual (`npm publish`, or `npm pack`
+for the tarball the gallery approves). npm includes `npm-shrinkwrap.json` in the
+tarball automatically, so no `files` entry is needed for it. Regenerate it whenever
+your dependencies change, which in practice means **once per release**: bump the
+version, run `npm install` and `npm shrinkwrap` again, and commit the refreshed
+lockfile alongside the new version.
+
 ### Installation Flow
 
 When a user clicks "Install" for a JavaScript extension in the gallery, the installer prepares the extension out of sight of the watcher and only reveals it once it is verified and complete:
@@ -418,6 +480,8 @@ Each JavaScript extension runs in its own Node.js process:
 - Separate event loop
 - No direct access to other extensions or CmdPal internals
 - Communication only through the JSON-RPC protocol
+
+This process separation is a fault and crash boundary, not a security boundary. An extension is not sandboxed: it runs with the user's full privileges (see [Permissions](#permissions) below), so a separate process does not contain what the extension's own code is allowed to do.
 
 ### Permissions
 

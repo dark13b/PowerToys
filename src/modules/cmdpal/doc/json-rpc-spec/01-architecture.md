@@ -36,7 +36,7 @@ flowchart LR
 2. **Resource isolation.** Each extension has independent memory, CPU, and event loop.
 3. **Independent debugging.** Attach a debugger to a specific extension's Node.js process via `--inspect`.
 4. **Clean lifecycle.** Stop or restart an extension by killing and re-spawning its process.
-5. **Security boundary.** Extensions cannot access host memory or other extensions' state.
+5. **Fault isolation, not a security sandbox.** Separate processes keep one extension from reading another extension's or the host's in-process memory, but this is a crash and fault boundary only. It is not a security or trust boundary: extension code runs with the user's full privileges, so treat every extension like any other Node.js program you choose to run.
 
 ### Crash Recovery
 
@@ -238,7 +238,9 @@ JS extensions run as **unsandboxed Node.js processes** with the same permissions
 
 ### Mitigations
 
-- **Process isolation.** Extensions cannot access host process memory.
+These reduce the blast radius of a misbehaving extension; they are not a security sandbox, because a gallery or sideloaded extension already runs with the user's full privileges.
+
+- **Process separation.** One extension's process cannot read another extension's or the host's in-process memory. This is a fault and crash boundary, not a trust boundary.
 - **No elevated privileges.** Extensions run at the user's permission level, never elevated.
 - **Crash containment.** Runaway extensions are auto-disabled after 3 consecutive crashes.
 - **No network exposure.** Communication is via stdio, not network sockets.

@@ -225,9 +225,12 @@ Fetches items for a list page.
         }
       ]
     }
-  ]
+  ],
+  "hasMoreItems": false
 }
 ```
+
+`hasMoreItems` is a boolean on the response envelope (it defaults to `false` when the extension omits it). `true` tells the host that more pages remain, so the host may issue a [`listPage/loadMore`](#listpageloadmore) request when the user scrolls to the end; `false` means the current items are the full set. The value comes straight from the list page's `hasMoreItems` property.
 
 The `section` field is ignored on any item that carries a command. The host renders a command-bearing item as a normal list item, so it never becomes a group header. `section` takes effect only on a command-less row, where it turns that row into a section header. To group command items visually, emit a standalone separator row (see below) before the group.
 
@@ -288,9 +291,15 @@ Requests additional items for infinite scroll.
 }
 ```
 
-**Response:** `null`
+**Response:** Same envelope as [`listPage/getItems`](#listpagegetitems), reflecting the page after the load:
+```json
+{
+  "items": [ /* the page's current items, including the appended page */ ],
+  "hasMoreItems": true
+}
+```
 
-The extension should append items and send a `listPage/itemsChanged` notification.
+The extension appends the next page to its items and returns the full, re-serialized item list along with `hasMoreItems`. A `hasMoreItems` of `false` (or an omitted flag) tells the host the extension has delivered its final page, so no further `listPage/loadMore` is issued. Extensions that instead mutate items out of band may also send a `listPage/itemsChanged` notification.
 
 ---
 
@@ -338,6 +347,7 @@ Fetches content for a content page.
   },
   {
     "type": "form",
+    "formId": "reply-form",
     "templateJson": "{...adaptive card JSON...}",
     "dataJson": "{...data values...}"
   }
@@ -354,10 +364,13 @@ Submits form data from a content page or form content.
 ```json
 {
   "pageId": "my-form-page",
+  "formId": "reply-form",
   "inputs": "{\"name\":\"John\"}",
   "data": "{}"
 }
 ```
+
+`formId` identifies the specific form to submit and is required whenever a page can serialize more than one form (for example multiple forms on a content page, or forms nested inside a `tree`). Each serialized `form` content block carries a `formId`: the extension author's explicit value when set, otherwise a stable id the serializer assigns in traversal order. The host echoes that `formId` back on submit, and the extension routes the submission to the matching form by `(pageId, formId)`. When `formId` is omitted (a host that does not yet send it), the extension falls back to the first form on the page, so single-form pages keep working without it.
 
 **Response:** Command result (same format as `command/invoke`).
 
