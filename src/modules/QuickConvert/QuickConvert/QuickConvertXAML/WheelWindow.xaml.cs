@@ -8,6 +8,7 @@ using System.Globalization;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using System.Threading.Tasks;
 
 using ManagedCommon;
@@ -50,6 +51,8 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
     private const int SmSwapButton = 23;
 
     private static readonly ResourceLoader Strings = new("PowerToys.QuickConvert.pri");
+    private static readonly string SettingsPath = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "PowerToys", "QuickConvert", "settings.json");
 
     private readonly KeyboardHook _hook;
     private readonly DispatcherQueueTimer _buttonWatch;
@@ -61,6 +64,7 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
     private int _releasedTicks;
     private bool _visible;
     private bool _busy;
+    private bool _liquidGlass;
 
     public WheelWindow()
     {
@@ -111,9 +115,10 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
         int size = (int)Math.Round(WindowSize * FlyoutWindowHelper.GetDpiScale(display));
         FlyoutWindowHelper.MoveAndResizeOnDisplay(this, display, new RectInt32(cursor.X - (size / 2), cursor.Y - (size / 2), size, size));
 
+        ApplyStyle(IsLiquidGlassEnabled());
         _files = [];
         SetTargets([]);
-        SetHub("", Strings.GetString("DropHere"));
+        SetHub("\uE8B7", Strings.GetString("DropHere"));
         _visible = true;
         _releasedTicks = 0;
         _buttonWatch.Start();
@@ -161,11 +166,11 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
 
             var glyph = kind switch
             {
-                FileConverter.Kind.Image => "",
-                FileConverter.Kind.Video => "",
-                FileConverter.Kind.Audio => "",
-                FileConverter.Kind.Pdf => "",
-                _ => "",
+                FileConverter.Kind.Image => "\uE91B",
+                FileConverter.Kind.Video => "\uE714",
+                FileConverter.Kind.Audio => "\uE8D6",
+                FileConverter.Kind.Pdf => "\uE8A5",
+                _ => "\uE783",
             };
             var text = kind == FileConverter.Kind.None ? Strings.GetString("Unsupported")
                 : _files.Count == 1 ? System.IO.Path.GetFileName(_files[0])
@@ -207,7 +212,7 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
         var files = _files;
         _busy = true;
         Busy.IsActive = true;
-        SetHub("", target.ToUpperInvariant());
+        SetHub("\uE895", target.ToUpperInvariant());
 
         bool failed = false;
         foreach (var file in files)
@@ -224,7 +229,7 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
         }
 
         Busy.IsActive = false;
-        SetHub(failed ? "" : "", Strings.GetString(failed ? "Failed" : "Done"));
+        SetHub(failed ? "\uE783" : "\uE73E", Strings.GetString(failed ? "Failed" : "Done"));
         await Task.Delay(700);
         _busy = false;
         Dismiss();
@@ -316,14 +321,56 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
     private void Paint(int index, bool hovered)
     {
         var (shape, label) = _sectors[index];
-        shape.Fill = Brush(hovered ? "AccentFillColorDefaultBrush" : "SubtleFillColorSecondaryBrush");
-        label.Foreground = Brush(hovered ? "TextOnAccentFillColorPrimaryBrush" : "TextFillColorPrimaryBrush");
+        if (_liquidGlass)
+        {
+            // Clear glass with hairline separators; the hovered sector becomes a brighter glass droplet.
+            shape.Fill = hovered ? Brush("GlassDropletBrush") : null;
+            shape.Stroke = Brush(hovered ? "GlassDropletStrokeBrush" : "GlassSeparatorBrush");
+            label.Foreground = Brush("TextFillColorPrimaryBrush");
+        }
+        else
+        {
+            shape.Fill = Brush(hovered ? "AccentFillColorDefaultBrush" : "SubtleFillColorSecondaryBrush");
+            shape.Stroke = null;
+            label.Foreground = Brush(hovered ? "TextOnAccentFillColorPrimaryBrush" : "TextFillColorPrimaryBrush");
+        }
+
         var scale = hovered ? new Vector3(1.05f, 1.05f, 1) : Vector3.One;
         shape.Scale = scale;
         label.Scale = scale;
     }
 
-    private static Brush Brush(string key) => (Brush)Application.Current.Resources[key];
+    private void ApplyStyle(bool liquidGlass)
+    {
+        if (liquidGlass == _liquidGlass)
+        {
+            return;
+        }
+
+        _liquidGlass = liquidGlass;
+
+        // A null Style falls back to the standard Fluent TransientSurface look.
+        Surface.Style = liquidGlass ? (Style)Root.Resources["LiquidGlassSurfaceStyle"] : null;
+        HubCircle.Fill = Brush(liquidGlass ? "GlassHubBrush" : "CardBackgroundFillColorDefaultBrush");
+        HubCircle.Stroke = Brush(liquidGlass ? "GlassRimBrush" : "CardStrokeColorDefaultBrush");
+    }
+
+    // ponytail: read straight from settings.json until the module has a Settings page that writes it.
+    private static bool IsLiquidGlassEnabled()
+    {
+        try
+        {
+            using var settings = JsonDocument.Parse(System.IO.File.ReadAllText(SettingsPath));
+            return settings.RootElement.GetProperty("properties").GetProperty("wheel_style").GetProperty("value").GetString() == "liquid-glass";
+        }
+        catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException or JsonException or KeyNotFoundException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private Brush Brush(string key) =>
+        (Brush)(Root.Resources.TryGetValue(key, out var local) ? local : Application.Current.Resources[key]);
 
     private static Point PointAt(double radius, double degreesFromTop)
     {

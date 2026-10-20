@@ -4,7 +4,8 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:common="using:Microsoft.PowerToys.Common.UI.Controls.Window"
-    xmlns:controls="using:Microsoft.PowerToys.Common.UI.Controls">
+    xmlns:controls="using:Microsoft.PowerToys.Common.UI.Controls"
+    xmlns:local="using:QuickConvert">
 
     <!--  Transparent background so the whole window is a drop target, not just the drawn parts.  -->
     <Grid
@@ -15,6 +16,62 @@
         DragLeave="Root_DragLeave"
         DragOver="Root_DragOver"
         Drop="Root_Drop">
+        <Grid.Resources>
+            <!--  Specular rim: bright where light hits the top-left edge, a softer echo bottom-right.  -->
+            <LinearGradientBrush x:Key="GlassRimBrush" StartPoint="0.15,0" EndPoint="0.85,1">
+                <GradientStop Offset="0" Color="#E6FFFFFF" />
+                <GradientStop Offset="0.35" Color="#26FFFFFF" />
+                <GradientStop Offset="0.7" Color="#14FFFFFF" />
+                <GradientStop Offset="1" Color="#8CFFFFFF" />
+            </LinearGradientBrush>
+            <LinearGradientBrush x:Key="GlassDropletBrush" StartPoint="0.5,0" EndPoint="0.5,1">
+                <GradientStop Offset="0" Color="#66FFFFFF" />
+                <GradientStop Offset="1" Color="#1AFFFFFF" />
+            </LinearGradientBrush>
+            <SolidColorBrush x:Key="GlassDropletStrokeBrush" Color="#B3FFFFFF" />
+            <SolidColorBrush x:Key="GlassSeparatorBrush" Color="#24FFFFFF" />
+            <SolidColorBrush x:Key="GlassHubBrush" Color="#14FFFFFF" />
+
+            <!--  "Liquid Glass": a clear blur with a specular rim, a top sheen and light gathering at the edge.  -->
+            <Style x:Key="LiquidGlassSurfaceStyle" TargetType="controls:TransientSurface">
+                <Setter Property="IsTabStop" Value="False" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="controls:TransientSurface">
+                            <Grid CornerRadius="{TemplateBinding CornerRadius}" Translation="0,0,32">
+                                <Grid.Shadow>
+                                    <ThemeShadow />
+                                </Grid.Shadow>
+                                <SystemBackdropElement CornerRadius="{TemplateBinding CornerRadius}">
+                                    <SystemBackdropElement.SystemBackdrop>
+                                        <local:GlassBackdrop />
+                                    </SystemBackdropElement.SystemBackdrop>
+                                </SystemBackdropElement>
+                                <Ellipse>
+                                    <Ellipse.Fill>
+                                        <RadialGradientBrush>
+                                            <GradientStop Offset="0.8" Color="#00FFFFFF" />
+                                            <GradientStop Offset="1" Color="#38FFFFFF" />
+                                        </RadialGradientBrush>
+                                    </Ellipse.Fill>
+                                </Ellipse>
+                                <Ellipse>
+                                    <Ellipse.Fill>
+                                        <LinearGradientBrush StartPoint="0.5,0" EndPoint="0.5,1">
+                                            <GradientStop Offset="0" Color="#33FFFFFF" />
+                                            <GradientStop Offset="0.45" Color="#00FFFFFF" />
+                                        </LinearGradientBrush>
+                                    </Ellipse.Fill>
+                                </Ellipse>
+                                <Ellipse Stroke="{StaticResource GlassRimBrush}" StrokeThickness="1.5" />
+                                <ContentPresenter Content="{TemplateBinding Content}" ContentTemplate="{TemplateBinding ContentTemplate}" />
+                            </Grid>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+        </Grid.Resources>
+
         <controls:TransientSurface
             x:Name="Surface"
             Width="336"
@@ -33,6 +90,7 @@
                     HorizontalAlignment="Center"
                     VerticalAlignment="Center">
                     <Ellipse
+                        x:Name="HubCircle"
                         Fill="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                         Stroke="{ThemeResource CardStrokeColorDefaultBrush}"
                         StrokeThickness="1" />
