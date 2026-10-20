@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<common:TransparentWindow
+    x:Class="QuickConvert.WheelWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:common="using:Microsoft.PowerToys.Common.UI.Controls.Window"
+    xmlns:controls="using:Microsoft.PowerToys.Common.UI.Controls">
+
+    <!--  Transparent background so the whole window is a drop target, not just the drawn parts.  -->
+    <Grid
+        x:Name="Root"
+        AllowDrop="True"
+        Background="Transparent"
+        DragEnter="Root_DragEnter"
+        DragLeave="Root_DragLeave"
+        DragOver="Root_DragOver"
+        Drop="Root_Drop">
+        <controls:TransientSurface
+            x:Name="Surface"
+            Width="336"
+            Height="336"
+            HorizontalAlignment="Center"
+            VerticalAlignment="Center"
+            CornerRadius="168"
+            HideTransition="Pop"
+            ShowTransition="Pop">
+            <Grid>
+                <Canvas x:Name="Ring" />
+
+                <Grid
+                    Width="116"
+                    Height="116"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Center">
+                    <Ellipse
+                        Fill="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        Stroke="{ThemeResource CardStrokeColorDefaultBrush}"
+                        StrokeThickness="1" />
+                    <ProgressRing
+                        x:Name="Busy"
+                        Width="112"
+                        Height="112"
+                        IsActive="False" />
+                    <StackPanel
+                        MaxWidth="96"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Spacing="6">
+                        <FontIcon
+                            x:Name="HubIcon"
+                            FontSize="28"
+                            Glyph="&#xE8B7;" />
+                        <TextBlock
+                            x:Name="HubText"
+                            HorizontalAlignment="Center"
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            MaxLines="2"
+                            Style="{StaticResource CaptionTextBlockStyle}"
+                            TextAlignment="Center"
+                            TextTrimming="CharacterEllipsis"
+                            TextWrapping="Wrap" />
+                    </StackPanel>
+                </Grid>
+            </Grid>
+        </controls:TransientSurface>
+    </Grid>
+</common:TransparentWindow>
