@@ -49,12 +49,14 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
     private const int VkLShift = 0xA0;
     private const int VkRShift = 0xA1;
     private const int SmSwapButton = 23;
+    private const int GaRoot = 2;
 
     private static readonly ResourceLoader Strings = new("PowerToys.QuickConvert.pri");
     private static readonly string SettingsPath = System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "PowerToys", "QuickConvert", "settings.json");
 
     private readonly KeyboardHook _hook;
+    private readonly LiquidGlass _glass;
     private readonly DispatcherQueueTimer _buttonWatch;
     private readonly List<(Path Shape, TextBlock Label)> _sectors = [];
 
@@ -73,6 +75,17 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
         IsAlwaysOnTop = true;
         Surface.SubscribeTo(this);
 
+        // Liquid Glass plays its own dissolve; keep the window up until it finishes.
+        _glass = new LiquidGlass(GlassCanvas);
+        Hiding += (_, e) =>
+        {
+            if (_liquidGlass)
+            {
+                var deferral = e.GetDeferral();
+                _glass.Hide(deferral.Complete);
+            }
+        };
+
         // The drag ends with a button release that only the drop source sees. Watch the button
         // while the wheel is open so it closes when the files are dropped somewhere else.
         _buttonWatch = DispatcherQueue.CreateTimer();
@@ -83,7 +96,11 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
         _hook.Start();
     }
 
-    public void Dispose() => _hook.Dispose();
+    public void Dispose()
+    {
+        _hook.Dispose();
+        _glass.Dispose();
+    }
 
     // Runs inside the low-level keyboard hook, so it must stay cheap. Returning true swallows
     // the Shift press, which also stops Explorer from switching the drag to "move".
@@ -112,10 +129,18 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
             return;
         }
 
-        int size = (int)Math.Round(WindowSize * FlyoutWindowHelper.GetDpiScale(display));
-        FlyoutWindowHelper.MoveAndResizeOnDisplay(this, display, new RectInt32(cursor.X - (size / 2), cursor.Y - (size / 2), size, size));
+        double scale = FlyoutWindowHelper.GetDpiScale(display);
+        int size = (int)Math.Round(WindowSize * scale);
+        var rect = new RectInt32(cursor.X - (size / 2), cursor.Y - (size / 2), size, size);
+        FlyoutWindowHelper.MoveAndResizeOnDisplay(this, display, rect);
 
         ApplyStyle(IsLiquidGlassEnabled());
+        if (_liquidGlass)
+        {
+            // Capture the backdrop while the wheel is still hidden.
+            _glass.Capture(rect, scale, GetAncestor(WindowFromPoint(cursor), GaRoot));
+        }
+
         _files = [];
         SetTargets([]);
         SetHub("\uE8B7", Strings.GetString("DropHere"));
@@ -123,6 +148,10 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
         _releasedTicks = 0;
         _buttonWatch.Start();
         Show();
+        if (_liquidGlass)
+        {
+            _glass.Show();
+        }
     }
 
     private void Dismiss()
@@ -316,28 +345,33 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
         {
             Paint(index, true);
         }
+
+        if (_liquidGlass)
+        {
+            _glass.SetHover(index, _targets.Length);
+        }
     }
 
     private void Paint(int index, bool hovered)
     {
         var (shape, label) = _sectors[index];
+        var scale = hovered ? new Vector3(1.05f, 1.05f, 1) : Vector3.One;
+        label.Scale = scale;
         if (_liquidGlass)
         {
-            // Clear glass with hairline separators; the hovered sector becomes a brighter glass droplet.
-            shape.Fill = hovered ? Brush("GlassDropletBrush") : null;
-            shape.Stroke = Brush(hovered ? "GlassDropletStrokeBrush" : "GlassSeparatorBrush");
+            // LiquidGlass draws the glass and the droplet; only hairline separators are left here.
+            shape.Fill = null;
+            shape.Stroke = Brush("GlassSeparatorBrush");
+            shape.Scale = Vector3.One;
             label.Foreground = Brush("TextFillColorPrimaryBrush");
         }
         else
         {
             shape.Fill = Brush(hovered ? "AccentFillColorDefaultBrush" : "SubtleFillColorSecondaryBrush");
             shape.Stroke = null;
+            shape.Scale = scale;
             label.Foreground = Brush(hovered ? "TextOnAccentFillColorPrimaryBrush" : "TextFillColorPrimaryBrush");
         }
-
-        var scale = hovered ? new Vector3(1.05f, 1.05f, 1) : Vector3.One;
-        shape.Scale = scale;
-        label.Scale = scale;
     }
 
     private void ApplyStyle(bool liquidGlass)
@@ -351,8 +385,9 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
 
         // A null Style falls back to the standard Fluent TransientSurface look.
         Surface.Style = liquidGlass ? (Style)Root.Resources["LiquidGlassSurfaceStyle"] : null;
-        HubCircle.Fill = Brush(liquidGlass ? "GlassHubBrush" : "CardBackgroundFillColorDefaultBrush");
-        HubCircle.Stroke = Brush(liquidGlass ? "GlassRimBrush" : "CardStrokeColorDefaultBrush");
+        GlassCanvas.Visibility = liquidGlass ? Visibility.Visible : Visibility.Collapsed;
+        HubCircle.Fill = liquidGlass ? null : Brush("CardBackgroundFillColorDefaultBrush");
+        HubCircle.Stroke = liquidGlass ? null : Brush("CardStrokeColorDefaultBrush");
     }
 
     // ponytail: read straight from settings.json until the module has a Settings page that writes it.
@@ -397,6 +432,12 @@ public sealed partial class WheelWindow : TransparentWindow, IDisposable
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool IsWindowVisible(nint hWnd);
+
+    [LibraryImport("user32.dll")]
+    private static partial nint WindowFromPoint(NativePoint point);
+
+    [LibraryImport("user32.dll")]
+    private static partial nint GetAncestor(nint hWnd, int gaFlags);
 
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

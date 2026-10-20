@@ -30,7 +30,9 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Graphics.Win2D" />
     <PackageReference Include="Microsoft.WindowsAppSDK" />
+    <PackageReference Include="System.Drawing.Common" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" />
     <PackageReference Include="WinUIEx" />
     <Manifest Include="$(ApplicationManifest)" />
